@@ -1,0 +1,227 @@
+name: Remove Image Background and Upload Release V2
+
+on:
+  workflow_dispatch:
+    inputs:
+      images:
+        description: "Image URLs separated by spaces. Optional custom name: URL|tree. Example: https://example.com/a.png|tree https://example.com/b.jpg|logo"
+        required: true
+        type: string
+      release_tag:
+        description: "Release tag to create or update"
+        required: true
+        default: "background-remover"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  remove-background:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install BiRefNet dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "torch==2.5.1+cpu" "torchvision==0.20.1+cpu" --extra-index-url https://download.pytorch.org/whl/cpu
+          python -m pip install "transformers>=4.46,<5" accelerate timm "numpy<2" opencv-python-headless scipy scikit-image kornia einops tqdm prettytable "huggingface-hub>0.25" pillow requests
+
+      - name: Download and validate all images
+        env:
+          IMAGES_INPUT: ${{ inputs.images }}
+        run: |
+          python - <<'PY'
+          import io
+          import json
+          import os
+          import re
+          from pathlib import Path
+          from urllib.parse import urlparse, unquote
+          import requests
+          from PIL import Image
+
+          raw = os.environ["IMAGES_INPUT"].strip()
+          if not raw:
+              raise SystemExit("ERROR: Please provide at least one image URL.")
+
+          items = re.split(r"\s+", raw)
+          if len(items) > 20:
+              raise SystemExit("ERROR: A maximum of 20 images is allowed per run.")
+
+          work_dir = Path("image-inputs")
+          work_dir.mkdir(exist_ok=True)
+          manifest = []
+          used_names = set()
+          max_bytes = 25 * 1024 * 1024
+          Image.MAX_IMAGE_PIXELS = 45_000_000
+
+          def safe_png_name(value, fallback):
+              value = (value or fallback).strip()
+              # The output is always a PNG, regardless of the source extension.
+              value = re.sub(r"(?i)\.png$", "", value)
+              value = re.sub(r"(?i)\.(jpg|jpeg|webp|bmp|gif|tif|tiff)$", "", value)
+              value = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip(".-_")
+              if not value:
+                  value = fallback
+              value = value[:90]
+              return value + ".png"
+
+          for index, item in enumerate(items, start=1):
+              if "|" in item:
+                  if item.count("|") != 1:
+                      raise SystemExit(f"ERROR: Item {index}: use only one '|' between URL and filename.")
+                  url, custom_name = item.split("|", 1)
+                  custom_name = custom_name.strip()
+                  if not custom_name:
+                      raise SystemExit(f"ERROR: Item {index}: filename is empty after '|'.")
+              else:
+                  url, custom_name = item, ""
+
+              parsed = urlparse(url)
+              if parsed.scheme not in ("http", "https") or not parsed.netloc or parsed.username or parsed.password:
+                  raise SystemExit(f"ERROR: Item {index}: enter a direct public http/https image URL.")
+
+              source_stem = Path(unquote(parsed.path)).stem
+              if not source_stem or source_stem in (".", "/"):
+                  source_stem = f"image-{index:02d}"
+              output_name = safe_png_name(custom_name, source_stem)
+              if output_name.lower() in used_names:
+                  raise SystemExit(f"ERROR: Duplicate output filename '{output_name}'. Give each image a different name.")
+              used_names.add(output_name.lower())
+
+              data = bytearray()
+              try:
+                  with requests.get(url, stream=True, timeout=(20, 60), headers={"User-Agent": "GitHubActions-BackgroundRemover/1.0"}) as response:
+                      response.raise_for_status()
+                      if urlparse(response.url).scheme not in ("http", "https"):
+                          raise ValueError("redirected to an unsupported URL scheme")
+                      content_length = response.headers.get("Content-Length")
+                      if content_length and int(content_length) > max_bytes:
+                          raise ValueError("image exceeds the 25 MB limit")
+                      for chunk in response.iter_content(chunk_size=1024 * 1024):
+                          if not chunk:
+                              continue
+                          data.extend(chunk)
+                          if len(data) > max_bytes:
+                              raise ValueError("image exceeds the 25 MB limit")
+                  with Image.open(io.BytesIO(data)) as image:
+                      if image.width * image.height > 45_000_000:
+                          raise ValueError("image exceeds the 45-megapixel limit")
+                      image.verify()
+              except Exception as exc:
+                  raise SystemExit(f"ERROR: Could not download or validate image {index} ({url}): {exc}")
+
+              input_path = work_dir / f"{index:02d}.bin"
+              input_path.write_bytes(data)
+              manifest.append({"input": str(input_path), "output": output_name, "url": url})
+              print(f"Validated image {index}: {output_name} ({len(data):,} bytes)")
+
+          Path("image-manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+          print(f"Successfully validated {len(manifest)} image(s).")
+          PY
+
+      - name: Remove backgrounds with BiRefNet
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import torch
+          import numpy as np
+          from PIL import Image, ImageOps
+          from torchvision import transforms
+          from transformers import AutoModelForImageSegmentation
+
+          torch.set_num_threads(min(4, os.cpu_count() or 2))
+          device = torch.device("cpu")
+          Image.MAX_IMAGE_PIXELS = 45_000_000
+          items = json.loads(Path("image-manifest.json").read_text(encoding="utf-8"))
+          out_dir = Path("dist")
+          out_dir.mkdir(exist_ok=True)
+
+          print("Loading ZhengPeng7/BiRefNet once for the full batch...")
+          model = AutoModelForImageSegmentation.from_pretrained(
+              "ZhengPeng7/BiRefNet",
+              trust_remote_code=True,
+          )
+          model.to(device).eval()
+          preprocess = transforms.Compose([
+              transforms.Resize((1024, 1024)),
+              transforms.ToTensor(),
+              transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+          ])
+
+          for index, item in enumerate(items, start=1):
+              print(f"Processing image {index}/{len(items)}: {item['output']}")
+              with Image.open(item["input"]) as source:
+                  image = ImageOps.exif_transpose(source).convert("RGB")
+              input_tensor = preprocess(image).unsqueeze(0).to(device)
+
+              with torch.inference_mode():
+                  outputs = model(input_tensor)
+                  prediction = outputs[-1] if isinstance(outputs, (tuple, list)) else outputs
+                  prediction = prediction.sigmoid().detach().cpu().squeeze()
+
+              mask_array = (prediction.clamp(0, 1).numpy() * 255).round().astype(np.uint8)
+              mask = Image.fromarray(mask_array, mode="L").resize(image.size, Image.Resampling.BILINEAR)
+              result = image.convert("RGBA")
+              result.putalpha(mask)
+              output_path = out_dir / item["output"]
+              result.save(output_path, format="PNG", optimize=True)
+              print(f"Saved {output_path} ({image.width}x{image.height})")
+
+          print(f"Background removal completed for {len(items)} image(s).")
+          PY
+
+      - name: Create or update GitHub Release and upload all PNGs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]]; then
+            echo "ERROR: release_tag may contain only letters, numbers, dots, underscores, and hyphens."
+            exit 1
+          fi
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release '$RELEASE_TAG' already exists; matching image assets will be replaced."
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Background Remover" \
+              --notes "Transparent PNG images generated by the BiRefNet background-removal workflow."
+          fi
+
+          shopt -s nullglob
+          files=(dist/*.png)
+          if (( ${#files[@]} == 0 )); then
+            echo "ERROR: No output PNG files were generated."
+            exit 1
+          fi
+
+          RELEASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}"
+          {
+            echo "## Background removal completed"
+            echo ""
+            echo "Processed ${#files[@]} image(s)."
+            echo ""
+            echo "- [Open GitHub Release](${RELEASE_URL})"
+            echo ""
+            for file in "${files[@]}"; do
+              filename="$(basename "$file")"
+              gh release upload "$RELEASE_TAG" "$file" --repo "$GITHUB_REPOSITORY" --clobber
+              echo "- [Download ${filename}](https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${filename})"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "All ${#files[@]} PNG file(s) uploaded to ${RELEASE_URL}"
