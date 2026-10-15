@@ -1,0 +1,157 @@
+name: Remove Image Background and Upload Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_url:
+        description: "Direct public URL of the image to process"
+        required: true
+        type: string
+      release_tag:
+        description: "Release tag to create or update"
+        required: true
+        default: "background-remover"
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  remove-background:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install BiRefNet dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "torch==2.5.1+cpu" "torchvision==0.20.1+cpu" --extra-index-url https://download.pytorch.org/whl/cpu
+          python -m pip install "transformers>=4.46,<5" accelerate timm "numpy<2" opencv-python-headless scipy scikit-image kornia einops tqdm prettytable "huggingface-hub>0.25" pillow requests
+
+      - name: Download and validate the image
+        env:
+          IMAGE_URL: ${{ inputs.image_url }}
+        run: |
+          python - <<'PY'
+          import io
+          import os
+          from urllib.parse import urlparse
+          import requests
+          from PIL import Image
+
+          url = os.environ["IMAGE_URL"].strip()
+          parsed = urlparse(url)
+          if parsed.scheme not in ("http", "https") or not parsed.netloc:
+              raise SystemExit("ERROR: image_url must be a direct http:// or https:// image URL.")
+
+          max_bytes = 25 * 1024 * 1024
+          data = bytearray()
+          with requests.get(url, stream=True, timeout=(20, 60), headers={"User-Agent": "GitHubActions-BackgroundRemover/1.0"}) as response:
+              response.raise_for_status()
+              if urlparse(response.url).scheme not in ("http", "https"):
+                  raise SystemExit("ERROR: the image URL redirected to an unsupported URL scheme.")
+              content_length = response.headers.get("Content-Length")
+              if content_length and int(content_length) > max_bytes:
+                  raise SystemExit("ERROR: image is larger than the 25 MB limit.")
+              for chunk in response.iter_content(chunk_size=1024 * 1024):
+                  if not chunk:
+                      continue
+                  data.extend(chunk)
+                  if len(data) > max_bytes:
+                      raise SystemExit("ERROR: image is larger than the 25 MB limit.")
+
+          Image.MAX_IMAGE_PIXELS = 45_000_000
+          try:
+              with Image.open(io.BytesIO(data)) as image:
+                  image.verify()
+          except Exception as exc:
+              raise SystemExit(f"ERROR: the URL did not return a supported, valid image: {exc}")
+
+          with open("source-image.bin", "wb") as file:
+              file.write(data)
+          print(f"Image downloaded and validated ({len(data):,} bytes).")
+          PY
+
+      - name: Remove the background with BiRefNet
+        run: |
+          python - <<'PY'
+          import os
+          import torch
+          import numpy as np
+          from PIL import Image, ImageOps
+          from torchvision import transforms
+          from transformers import AutoModelForImageSegmentation
+
+          torch.set_num_threads(min(4, os.cpu_count() or 2))
+          device = torch.device("cpu")
+          Image.MAX_IMAGE_PIXELS = 45_000_000
+
+          with Image.open("source-image.bin") as source:
+              image = ImageOps.exif_transpose(source).convert("RGB")
+
+          preprocess = transforms.Compose([
+              transforms.Resize((1024, 1024)),
+              transforms.ToTensor(),
+              transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+          ])
+          input_tensor = preprocess(image).unsqueeze(0).to(device)
+
+          print("Loading ZhengPeng7/BiRefNet model from Hugging Face...")
+          model = AutoModelForImageSegmentation.from_pretrained(
+              "ZhengPeng7/BiRefNet",
+              trust_remote_code=True,
+          )
+          model.to(device).eval()
+
+          with torch.inference_mode():
+              outputs = model(input_tensor)
+              prediction = outputs[-1] if isinstance(outputs, (tuple, list)) else outputs
+              prediction = prediction.sigmoid().detach().cpu().squeeze()
+
+          mask_array = (prediction.clamp(0, 1).numpy() * 255).round().astype(np.uint8)
+          mask = Image.fromarray(mask_array, mode="L").resize(image.size, Image.Resampling.BILINEAR)
+          result = image.convert("RGBA")
+          result.putalpha(mask)
+          result.save("background-removed.png", format="PNG", optimize=True)
+          print(f"Done. Transparent PNG size: {image.width}x{image.height}.")
+          PY
+
+      - name: Create or update GitHub Release and upload PNG
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]]; then
+            echo "ERROR: release_tag may contain only letters, numbers, dots, underscores, and hyphens."
+            exit 1
+          fi
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release '$RELEASE_TAG' already exists; updating its PNG asset."
+          else
+            gh release create "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "Background Remover" \
+              --notes "Transparent PNG images generated by the BiRefNet background-removal workflow."
+          fi
+
+          gh release upload "$RELEASE_TAG" background-removed.png \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+          RELEASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}"
+          ASSET_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/background-removed.png"
+          {
+            echo "## Background removal completed"
+            echo ""
+            echo "- [Open GitHub Release](${RELEASE_URL})"
+            echo "- [Download transparent PNG](${ASSET_URL})"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Uploaded: ${ASSET_URL}"
