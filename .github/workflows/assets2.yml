@@ -1,4 +1,4 @@
-name: Process Images and Audio Assets with BiRefNet and FFmpeg
+name: Process Images and Audio Assets with BiRefNet and FFmpeg v2
 
 on:
   workflow_dispatch:
