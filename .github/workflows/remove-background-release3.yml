@@ -1,4 +1,4 @@
-name: Remove Image Background and Upload Release
+name: Remove Image Background and Upload Release V3
 
 on:
   workflow_dispatch:
