@@ -1,0 +1,670 @@
+name: Process Images and Audio Assets with BiRefNet and FFmpeg
+
+on:
+  workflow_dispatch:
+    inputs:
+      assets:
+        description: "Public image/audio URLs separated by spaces; name any asset with |, e.g. URL|tree URL|voice. Use direct download URLs."
+        required: true
+        type: string
+      release_tag:
+        description: "Release tag to create or update"
+        required: true
+        default: "background-remover"
+        type: string
+      compression_mode:
+        description: "Compression: lossless_png (pixel-perfect PNG), balanced_png (smaller PNG, slight quality trade-off), webp_high_quality (usually much smaller WebP with transparency), or none"
+        required: true
+        type: choice
+        options:
+          - lossless_png
+          - balanced_png
+          - webp_high_quality
+          - none
+        default: lossless_png
+      audio_format:
+        description: "Audio output/compression: MP3 (compatible), Opus (compact), AAC (M4A), or lossless FLAC"
+        required: true
+        type: choice
+        options:
+          - mp3_320k
+          - mp3_192k
+          - mp3_128k
+          - opus_128k
+          - aac_192k
+          - flac_lossless
+        default: mp3_192k
+      audio_speed:
+        description: "Audio playback speed; atempo keeps pitch as close as possible"
+        required: true
+        type: choice
+        options:
+          - "1.00"
+          - "1.03"
+          - "1.05"
+          - "1.10"
+        default: "1.03"
+
+permissions:
+  contents: write
+
+jobs:
+  remove-background:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Set up Python
+        id: setup-python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Restore lightweight asset validation environment cache
+        id: asset-python-cache
+        uses: actions/cache@v4
+        with:
+          path: .asset-venv
+          key: asset-python-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-v1
+
+      - name: Install lightweight asset validation dependencies
+        if: steps.asset-python-cache.outputs.cache-hit != 'true'
+        run: |
+          python -m venv .asset-venv
+          .asset-venv/bin/python -m pip install --upgrade pip
+          .asset-venv/bin/python -m pip install requests pillow
+
+      - name: Download and identify image/audio assets
+        id: prepare-assets
+        env:
+          ASSETS_INPUT: ${{ inputs.assets }}
+        run: |
+          .asset-venv/bin/python - <<'PY'
+          import hashlib
+          import io
+          import json
+          import os
+          import re
+          from pathlib import Path
+          from urllib.parse import urlparse, unquote, urlunparse
+          import requests
+          from PIL import Image, UnidentifiedImageError
+
+          raw = os.environ["ASSETS_INPUT"].strip()
+          if not raw:
+              raise SystemExit("ERROR: Please provide at least one public image/audio URL.")
+          tokens = re.split(r"\s+", raw)
+          if len(tokens) > 20:
+              raise SystemExit("ERROR: A maximum of 20 assets is allowed per run.")
+
+          work_dir = Path("asset-inputs")
+          work_dir.mkdir(exist_ok=True)
+          entries = []
+          used_tokens = set()
+          max_download_bytes = 120 * 1024 * 1024
+          Image.MAX_IMAGE_PIXELS = 45_000_000
+
+          def safe_stem(value, fallback):
+              value = (value or fallback).strip()
+              value = re.sub(r"(?i)\.(png|jpe?g|webp|bmp|gif|tiff?|mp3|wav|flac|m4a|aac|ogg|opus|wma|aiff?|mp4|mkv|mov)$", "", value)
+              value = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip(".-_")[:90]
+              return value or fallback
+
+          for index, token in enumerate(tokens, start=1):
+              if "|" in token:
+                  if token.count("|") != 1:
+                      raise SystemExit(f"ERROR: Asset {index}: use exactly one '|' between URL and custom name.")
+                  url, custom_name = token.split("|", 1)
+                  custom_name = custom_name.strip()
+                  if not custom_name:
+                      raise SystemExit(f"ERROR: Asset {index}: custom filename after '|' cannot be empty.")
+              else:
+                  url, custom_name = token, ""
+                  # Compatibility for the earlier accidental format: URL.ext/NAME
+                  parsed_legacy = urlparse(url)
+                  legacy_match = re.match(
+                      r"^(.*\.(?:png|jpe?g|webp|bmp|gif|tiff?|mp3|wav|flac|m4a|aac|ogg|opus|wma|aiff?))/([A-Za-z0-9][A-Za-z0-9._-]*)$",
+                      parsed_legacy.path,
+                      flags=re.IGNORECASE,
+                  )
+                  if legacy_match:
+                      clean_path, legacy_name = legacy_match.groups()
+                      url = urlunparse(parsed_legacy._replace(path=clean_path))
+                      custom_name = legacy_name
+                      print(f"Recovered legacy URL/name format for asset {index}: output stem '{custom_name}'.")
+
+              parsed = urlparse(url)
+              if parsed.scheme not in ("http", "https") or not parsed.netloc or parsed.username or parsed.password:
+                  raise SystemExit(f"ERROR: Asset {index}: use a direct public HTTP/HTTPS URL without embedded credentials.")
+
+              fallback = Path(unquote(parsed.path)).stem or f"asset-{index:02d}"
+              stem = safe_stem(custom_name, safe_stem(fallback, f"asset-{index:02d}"))
+              if stem.lower() in used_tokens:
+                  raise SystemExit(f"ERROR: Duplicate asset name '{stem}'. Give each asset a unique name.")
+              used_tokens.add(stem.lower())
+
+              data = bytearray()
+              try:
+                  with requests.get(url, stream=True, timeout=(20, 90), headers={"User-Agent": "GitHubActions-MediaProcessor/1.0"}) as response:
+                      response.raise_for_status()
+                      if urlparse(response.url).scheme not in ("http", "https"):
+                          raise ValueError("redirected to an unsupported URL scheme")
+                      content_length = response.headers.get("Content-Length")
+                      if content_length and int(content_length) > max_download_bytes:
+                          raise ValueError("asset exceeds the 120 MB limit")
+                      for chunk in response.iter_content(chunk_size=1024 * 1024):
+                          if chunk:
+                              data.extend(chunk)
+                              if len(data) > max_download_bytes:
+                                  raise ValueError("asset exceeds the 120 MB limit")
+
+                  kind = "pending-audio"
+                  try:
+                      with Image.open(io.BytesIO(data)) as image:
+                          width, height = image.size
+                          if width * height > 45_000_000:
+                              raise ValueError("image exceeds the 45-megapixel limit")
+                          image.verify()
+                      if len(data) > 25 * 1024 * 1024:
+                          raise ValueError("image exceeds the 25 MB image limit")
+                      kind = "image"
+                  except (UnidentifiedImageError, OSError):
+                      # Audio/other formats are verified by ffprobe in the next step.
+                      kind = "pending-audio"
+
+                  input_path = work_dir / f"{index:02d}.bin"
+                  input_path.write_bytes(data)
+                  entries.append({
+                      "index": index,
+                      "input": str(input_path),
+                      "stem": stem,
+                      "kind": kind,
+                      "url": url,
+                      "source_bytes": len(data),
+                      "source_sha256": hashlib.sha256(data).hexdigest(),
+                  })
+                  print(f"Downloaded asset {index}: {stem} ({len(data):,} bytes; {kind}).")
+              except Exception as exc:
+                  raise SystemExit(f"ERROR: Could not download or inspect asset {index} ({url}): {exc}")
+
+          Path("asset-manifest.json").write_text(json.dumps(entries, ensure_ascii=False, indent=2), encoding="utf-8")
+          image_count = sum(1 for entry in entries if entry["kind"] == "image")
+          candidate_count = len(entries) - image_count
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"image_count={image_count}\n")
+              output.write(f"candidate_count={candidate_count}\n")
+          print(f"Initial check complete: {image_count} image(s), {candidate_count} asset(s) to verify as audio.")
+          PY
+
+      - name: Prepare media tools APT archive cache
+        if: steps.prepare-assets.outputs.candidate_count != '0' || (steps.prepare-assets.outputs.image_count != '0' && inputs.compression_mode != 'none')
+        run: |
+          mkdir -p .apt-cache/archives/partial
+          chmod -R a+rwx .apt-cache/archives
+
+      - name: Restore cached media tools packages
+        if: steps.prepare-assets.outputs.candidate_count != '0' || (steps.prepare-assets.outputs.image_count != '0' && inputs.compression_mode != 'none')
+        uses: actions/cache@v4
+        with:
+          path: .apt-cache/archives
+          key: apt-media-${{ runner.os }}-${{ inputs.compression_mode }}-${{ steps.prepare-assets.outputs.candidate_count != '0' && 'with-audio' || 'images-only' }}-v1
+
+      - name: Configure local APT archive cache
+        if: steps.prepare-assets.outputs.candidate_count != '0' || (steps.prepare-assets.outputs.image_count != '0' && inputs.compression_mode != 'none')
+        run: |
+          mkdir -p .apt-cache/archives/partial
+          chmod -R a+rwx .apt-cache/archives
+          printf 'Dir::Cache::archives "%s/.apt-cache/archives";\nAPT::Keep-Downloaded-Packages "true";\n' "$GITHUB_WORKSPACE" | sudo tee /etc/apt/apt.conf.d/99-workspace-archive-cache >/dev/null
+
+      - name: Install FFmpeg for audio validation/processing
+        if: steps.prepare-assets.outputs.candidate_count != '0'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+
+      - name: Validate audio streams and prepare output manifest
+        id: resolve-assets
+        env:
+          AUDIO_FORMAT: ${{ inputs.audio_format }}
+        run: |
+          .asset-venv/bin/python - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          manifest_path = Path("asset-manifest.json")
+          items = json.loads(manifest_path.read_text(encoding="utf-8"))
+          extension = {
+              "mp3_320k": "mp3",
+              "mp3_192k": "mp3",
+              "mp3_128k": "mp3",
+              "opus_128k": "opus",
+              "aac_192k": "m4a",
+              "flac_lossless": "flac",
+          }
+          mode = os.environ["AUDIO_FORMAT"]
+          if mode not in extension:
+              raise SystemExit(f"ERROR: Unsupported audio format: {mode}")
+
+          for item in items:
+              if item["kind"] == "pending-audio":
+                  probe = subprocess.run(
+                      ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=codec_type", "-of", "default=noprint_wrappers=1:nokey=1", item["input"]],
+                      text=True, capture_output=True, timeout=45,
+                  )
+                  if probe.returncode != 0 or "audio" not in probe.stdout.split():
+                      message = probe.stderr.strip()[-600:] or "No audio stream found."
+                      raise SystemExit(f"ERROR: Asset {item['index']} is not a supported image or audio file: {message}")
+                  item["kind"] = "audio"
+                  item["output"] = f"{item['stem']}.{extension[mode]}"
+              else:
+                  item["output"] = f"{item['stem']}.png"
+
+          outputs = [item["output"].lower() for item in items]
+          if len(outputs) != len(set(outputs)):
+              raise SystemExit("ERROR: Two assets would produce the same output filename. Rename them so every output name is unique.")
+          manifest_path.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+          image_count = sum(1 for item in items if item["kind"] == "image")
+          audio_count = sum(1 for item in items if item["kind"] == "audio")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"image_count={image_count}\n")
+              output.write(f"audio_count={audio_count}\n")
+          print(f"Validated {image_count} image(s) and {audio_count} audio asset(s).")
+          PY
+      - name: Restore BiRefNet Python environment cache
+        if: steps.resolve-assets.outputs.image_count != '0'
+        id: python-env-cache
+        uses: actions/cache@v4
+        with:
+          path: .venv
+          # Bump v1 to v2 if the Python version or dependency list changes.
+          key: birefnet-python-${{ runner.os }}-${{ steps.setup-python.outputs.python-version }}-v1
+
+      - name: Install BiRefNet dependencies
+        if: steps.resolve-assets.outputs.image_count != '0' && steps.python-env-cache.outputs.cache-hit != 'true'
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/python -m pip install "torch==2.5.1+cpu" "torchvision==0.20.1+cpu" --extra-index-url https://download.pytorch.org/whl/cpu
+          .venv/bin/python -m pip install "transformers>=4.46,<5" accelerate timm "numpy<2" opencv-python-headless scipy scikit-image kornia einops tqdm prettytable "huggingface-hub>0.25" pillow requests
+
+      - name: Restore BiRefNet from Actions cache when available
+        if: steps.resolve-assets.outputs.image_count != '0'
+        uses: actions/cache@v4
+        with:
+          path: birefnet-model
+          key: birefnet-model-${{ runner.os }}-v1
+
+      - name: Restore persistent BiRefNet model or download it once
+        if: steps.resolve-assets.outputs.image_count != '0'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MODEL_RELEASE_TAG: birefnet-model-v1
+        run: |
+          set -euo pipefail
+          MODEL_DIR="birefnet-model"
+          ASSET_DIR=".model-release-download"
+          ARCHIVE="birefnet-model.tar.gz"
+          CHECKSUM="birefnet-model.sha256"
+          CACHE_READY=false
+          CACHE_PUBLISHED=false
+          CACHE_SOURCE=""
+
+          rm -rf "$ASSET_DIR"
+          mkdir -p "$ASSET_DIR"
+
+          # First choice: the fast Actions cache. It can expire, so a Release fallback is kept below.
+          if [[ -s "$MODEL_DIR/config.json" && -s "$MODEL_DIR/model.safetensors" ]]; then
+            CACHE_READY=true
+            CACHE_SOURCE="GitHub Actions cache"
+            echo "Restored the model from GitHub Actions cache; no model download needed."
+          fi
+
+          # Second choice: the persistent Release asset, with SHA-256 verification.
+          if [[ "$CACHE_READY" != "true" ]]; then
+            echo "Checking GitHub Release '$MODEL_RELEASE_TAG' for the saved model..."
+            if gh release view "$MODEL_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              if gh release download "$MODEL_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$ASSET_DIR" >/dev/null 2>&1; then
+                if [[ -s "$ASSET_DIR/$ARCHIVE" && -s "$ASSET_DIR/$CHECKSUM" ]]; then
+                  if (cd "$ASSET_DIR" && sha256sum --check "$CHECKSUM") >/dev/null 2>&1; then
+                    if tar -xzf "$ASSET_DIR/$ARCHIVE" -C .; then
+                      if [[ -s "$MODEL_DIR/config.json" && -s "$MODEL_DIR/model.safetensors" ]]; then
+                        CACHE_READY=true
+                        CACHE_SOURCE="GitHub Release (SHA-256 verified)"
+                        echo "Restored the model from GitHub Release; Hugging Face download skipped."
+                      fi
+                    fi
+                  fi
+                fi
+              fi
+            fi
+          fi
+
+          # Last choice: download from Hugging Face, then publish a persistent Release bundle.
+          if [[ "$CACHE_READY" != "true" ]]; then
+            echo "No valid saved model was found. Downloading BiRefNet from Hugging Face..."
+            rm -rf "$MODEL_DIR"
+            .venv/bin/python - <<'PYMODEL'
+          from huggingface_hub import snapshot_download
+
+          snapshot_download(
+              repo_id="ZhengPeng7/BiRefNet",
+              local_dir="birefnet-model",
+              ignore_patterns=["*.md", "*.png", "*.jpg", "*.jpeg", "*.webp", "*.gif"],
+          )
+          PYMODEL
+
+            if [[ ! -s "$MODEL_DIR/config.json" || ! -s "$MODEL_DIR/model.safetensors" ]]; then
+              echo "ERROR: Hugging Face download completed but the expected model files are missing."
+              exit 1
+            fi
+
+            echo "Packaging the model for persistent storage..."
+            tar --exclude="$MODEL_DIR/.cache" -czf "$ARCHIVE" "$MODEL_DIR"
+            sha256sum "$ARCHIVE" > "$CHECKSUM"
+
+            if gh release view "$MODEL_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              if gh release upload "$MODEL_RELEASE_TAG" "$ARCHIVE" "$CHECKSUM" --repo "$GITHUB_REPOSITORY" --clobber; then
+                CACHE_PUBLISHED=true
+              fi
+            else
+              if gh release create "$MODEL_RELEASE_TAG" "$ARCHIVE" "$CHECKSUM" \
+                --repo "$GITHUB_REPOSITORY" \
+                --target "$GITHUB_SHA" \
+                --title "BiRefNet Model Cache" \
+                --notes "Persistent model files for the background-removal workflow. The archive is verified by SHA-256."; then
+                CACHE_PUBLISHED=true
+              else
+                # Recover if another workflow created the Release at the same time.
+                if gh release view "$MODEL_RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+                  if gh release upload "$MODEL_RELEASE_TAG" "$ARCHIVE" "$CHECKSUM" --repo "$GITHUB_REPOSITORY" --clobber; then
+                    CACHE_PUBLISHED=true
+                  fi
+                fi
+              fi
+            fi
+
+            if [[ "$CACHE_PUBLISHED" == "true" ]]; then
+              CACHE_SOURCE="Hugging Face; persisted in GitHub Release '$MODEL_RELEASE_TAG'"
+              echo "Persistent model cache created/updated in GitHub Release '$MODEL_RELEASE_TAG'."
+            else
+              CACHE_SOURCE="Hugging Face; Release publishing failed"
+              echo "::warning::The model was downloaded for this run, but publishing the persistent Release cache failed. This run will continue; a later run may need to download the model again."
+            fi
+          fi
+
+          if [[ ! -s "$MODEL_DIR/config.json" || ! -s "$MODEL_DIR/model.safetensors" ]]; then
+            echo "ERROR: BiRefNet model files are not available after restore/download."
+            exit 1
+          fi
+
+          echo "### BiRefNet model cache" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Source: $CACHE_SOURCE." >> "$GITHUB_STEP_SUMMARY"
+          if [[ "$CACHE_PUBLISHED" == "true" ]]; then
+            echo "- Persistent copy saved to GitHub Release '$MODEL_RELEASE_TAG'." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Remove backgrounds with BiRefNet
+        if: steps.resolve-assets.outputs.image_count != '0'
+        run: |
+          .venv/bin/python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import torch
+          import numpy as np
+          from PIL import Image, ImageOps
+          from torchvision import transforms
+          from transformers import AutoModelForImageSegmentation
+
+          torch.set_num_threads(min(4, os.cpu_count() or 2))
+          device = torch.device("cpu")
+          Image.MAX_IMAGE_PIXELS = 45_000_000
+          all_items = json.loads(Path("asset-manifest.json").read_text(encoding="utf-8"))
+          items = [item for item in all_items if item["kind"] == "image"]
+          out_dir = Path("dist")
+          out_dir.mkdir(exist_ok=True)
+
+          print("Loading the locally restored BiRefNet model once for this image batch...")
+          model = AutoModelForImageSegmentation.from_pretrained(
+              "birefnet-model",
+              trust_remote_code=True,
+              local_files_only=True,
+          )
+          model.to(device).eval()
+          preprocess = transforms.Compose([
+              transforms.Resize((1024, 1024)),
+              transforms.ToTensor(),
+              transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+          ])
+
+          for index, item in enumerate(items, start=1):
+              print(f"Processing image {index}/{len(items)}: {item['output']}")
+              with Image.open(item["input"]) as source:
+                  image = ImageOps.exif_transpose(source).convert("RGB")
+              input_tensor = preprocess(image).unsqueeze(0).to(device)
+
+              with torch.inference_mode():
+                  outputs = model(input_tensor)
+                  prediction = outputs[-1] if isinstance(outputs, (tuple, list)) else outputs
+                  prediction = prediction.sigmoid().detach().cpu().squeeze()
+
+              mask_array = (prediction.clamp(0, 1).numpy() * 255).round().astype(np.uint8)
+              mask = Image.fromarray(mask_array, mode="L").resize(image.size, Image.Resampling.BILINEAR)
+              result = image.convert("RGBA")
+              result.putalpha(mask)
+              output_path = out_dir / item["output"]
+              result.save(output_path, format="PNG", optimize=True)
+              print(f"Saved {output_path} ({image.width}x{image.height})")
+
+          print(f"Background removal completed for {len(items)} image(s).")
+          PY
+      - name: Compress generated images (optional)
+        if: steps.resolve-assets.outputs.image_count != '0'
+        env:
+          COMPRESSION_MODE: ${{ inputs.compression_mode }}
+        run: |
+          set -euo pipefail
+          MODE="$COMPRESSION_MODE"
+
+          case "$MODE" in
+            lossless_png)
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends optipng
+              ;;
+            balanced_png)
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends optipng pngquant
+              ;;
+            webp_high_quality)
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends webp
+              ;;
+            none)
+              echo "No additional compression selected; PNG files already use Pillow's optimize=True."
+              ;;
+            *)
+              echo "ERROR: Unsupported compression mode: $MODE"
+              exit 1
+              ;;
+          esac
+
+          shopt -s nullglob
+          files=(dist/*.png)
+          if (( ${#files[@]} == 0 )); then
+            echo "ERROR: No PNG files found to compress."
+            exit 1
+          fi
+
+          echo "## Image compression results" >> "$GITHUB_STEP_SUMMARY"
+          echo "Selected mode: \`$MODE\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| File | Before | After | Saved |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---:|---:|---:|" >> "$GITHUB_STEP_SUMMARY"
+
+          for file in "${files[@]}"; do
+            before=$(stat -c '%s' "$file")
+            output="$file"
+
+            case "$MODE" in
+              lossless_png)
+                # OptiPNG recompresses the PNG without changing decoded pixels or alpha.
+                optipng -quiet -o2 "$file"
+                ;;
+              balanced_png)
+                # Try high-quality palette quantization; if it cannot meet the quality
+                # floor or fails, keep the original PNG and continue safely.
+                temp="${file%.png}.quantized.png"
+                rm -f "$temp"
+                if pngquant --quality=85-95 --speed 3 --skip-if-larger --output "$temp" "$file"; then
+                  if [[ -s "$temp" ]] && (( $(stat -c '%s' "$temp") < before )); then
+                    mv "$temp" "$file"
+                  else
+                    rm -f "$temp"
+                  fi
+                else
+                  status=$?
+                  rm -f "$temp"
+                  echo "pngquant could not produce an acceptable smaller image for $(basename "$file") (exit $status); keeping original."
+                fi
+                optipng -quiet -o2 "$file"
+                ;;
+              webp_high_quality)
+                output="${file%.png}.webp"
+                # Keep the alpha channel lossless; RGB color uses high-quality lossy WebP.
+                cwebp -quiet -q 95 -m 6 -alpha_q 100 -exact "$file" -o "$output"
+                if [[ ! -s "$output" ]]; then
+                  echo "ERROR: WebP conversion failed for $file"
+                  exit 1
+                fi
+                rm "$file"
+                ;;
+              none)
+                ;;
+            esac
+
+            after=$(stat -c '%s' "$output")
+            if (( before > 0 )); then
+              saved=$(( (before - after) * 100 / before ))
+            else
+              saved=0
+            fi
+            printf '| %s | %s | %s | %s%% |\n' "$(basename "$output")" "$before" "$after" "$saved" >> "$GITHUB_STEP_SUMMARY"
+            echo "$(basename "$output"): $before -> $after bytes (${saved}% size reduction; negative means larger)."
+          done
+
+      - name: Process and compress audio assets with FFmpeg
+        if: steps.resolve-assets.outputs.audio_count != '0'
+        env:
+          AUDIO_FORMAT: ${{ inputs.audio_format }}
+          AUDIO_SPEED: ${{ inputs.audio_speed }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          .asset-venv/bin/python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          items = json.loads(Path("asset-manifest.json").read_text(encoding="utf-8"))
+          items = [item for item in items if item["kind"] == "audio"]
+          mode = os.environ["AUDIO_FORMAT"]
+          speed = float(os.environ["AUDIO_SPEED"])
+          if speed not in (1.00, 1.03, 1.05, 1.10):
+              raise SystemExit("ERROR: Invalid audio speed. Choose 1.00, 1.03, 1.05, or 1.10.")
+
+          codecs = {
+              "mp3_320k": ["-c:a", "libmp3lame", "-b:a", "320k", "-compression_level", "3"],
+              "mp3_192k": ["-c:a", "libmp3lame", "-b:a", "192k", "-compression_level", "3"],
+              "mp3_128k": ["-c:a", "libmp3lame", "-b:a", "128k", "-compression_level", "3"],
+              "opus_128k": ["-c:a", "libopus", "-b:a", "128k", "-vbr", "on", "-compression_level", "5"],
+              "aac_192k": ["-c:a", "aac", "-b:a", "192k"],
+              "flac_lossless": ["-c:a", "flac", "-compression_level", "5"],
+          }
+          if mode not in codecs:
+              raise SystemExit(f"ERROR: Unsupported audio format: {mode}")
+
+          summary_path = os.environ["GITHUB_STEP_SUMMARY"]
+          with open(summary_path, "a", encoding="utf-8") as summary:
+              summary.write("## Audio processing results\n\n")
+              summary.write(f"- Output mode: `{mode}`\n")
+              summary.write(f"- Playback speed: `{speed:.2f}x` (pitch-preserving `atempo` filter)\n\n")
+              summary.write("| File | Input size | Output size | Size change | SHA-256 changed |\n")
+              summary.write("|---|---:|---:|---:|---|\n")
+
+          for item in items:
+              source = Path(item["input"])
+              output = Path("dist") / item["output"]
+              command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", str(source),
+                         "-map", "0:a:0", "-vn", "-sn", "-dn", "-map_metadata", "-1", "-map_chapters", "-1"]
+              if speed != 1.0:
+                  command += ["-af", f"atempo={speed:.2f}"]
+              command += codecs[mode] + [str(output)]
+              print(f"Encoding {item['stem']} -> {output.name} ({mode}, {speed:.2f}x)...")
+              result = subprocess.run(command, text=True, capture_output=True, timeout=900)
+              if result.returncode != 0 or not output.exists() or output.stat().st_size == 0:
+                  output.unlink(missing_ok=True)
+                  raise SystemExit(f"ERROR: FFmpeg failed for asset {item['index']}: {result.stderr[-2000:]}")
+
+              input_hash = item["source_sha256"]
+              output_hash = hashlib.sha256(output.read_bytes()).hexdigest()
+              input_size = int(item["source_bytes"])
+              output_size = output.stat().st_size
+              delta = (output_size - input_size) * 100 / input_size if input_size else 0
+              direction = f"{abs(delta):.1f}% {'smaller' if delta < 0 else 'larger'}" if delta else "same size"
+              changed = "yes" if input_hash != output_hash else "no"
+              with open(summary_path, "a", encoding="utf-8") as summary:
+                  summary.write(f"| {output.name} | {input_size:,} B | {output_size:,} B | {direction} | {changed} |\n")
+                  summary.write(f"\nSource SHA-256 `{item['stem']}`: `{input_hash}`\n")
+                  summary.write(f"Output SHA-256 `{output.name}`: `{output_hash}`\n\n")
+              print(f"Done: {output.name}; {input_size:,} -> {output_size:,} bytes ({direction}); SHA-256 changed: {changed}.")
+              print(f"Source SHA-256: {input_hash}")
+              print(f"Output SHA-256: {output_hash}")
+          PY
+      - name: Create or update GitHub Release and upload all processed assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$RELEASE_TAG" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$ ]]; then
+            echo "ERROR: release_tag may contain only letters, numbers, dots, underscores, and hyphens."
+            exit 1
+          fi
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release '$RELEASE_TAG' already exists; matching asset filenames will be replaced."
+          else
+            gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              --title "Processed Media Assets" \
+              --notes "Image outputs processed by BiRefNet and audio outputs processed by FFmpeg. Exact options and SHA-256 values are recorded in the Actions run summary."
+          fi
+
+          shopt -s nullglob
+          files=(dist/*)
+          if (( ${#files[@]} == 0 )); then
+            echo "ERROR: No processed media assets were generated."
+            exit 1
+          fi
+          for file in "${files[@]}"; do
+            [[ -f "$file" ]] || continue
+            gh release upload "$RELEASE_TAG" "$file" --repo "$GITHUB_REPOSITORY" --clobber
+          done
+
+          RELEASE_URL="https://github.com/${GITHUB_REPOSITORY}/releases/tag/${RELEASE_TAG}"
+          {
+            echo "## Media processing completed"
+            echo ""
+            echo "Processed and uploaded ${#files[@]} asset(s)."
+            echo ""
+            echo "- [Open GitHub Release](${RELEASE_URL})"
+            echo ""
+            for file in "${files[@]}"; do
+              [[ -f "$file" ]] || continue
+              filename="$(basename "$file")"
+              echo "- [Download ${filename}](https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}/${filename})"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Uploaded ${#files[@]} processed asset(s) to ${RELEASE_URL}."
